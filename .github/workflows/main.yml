@@ -3,41 +3,135 @@ name: Wails build
 on:
   push:
     tags:
-    # Match any new tag
       - '*'
 
 env:
-  # Necessary for most environments as build failure can occur due to OOM issues
   NODE_OPTIONS: "--max-old-space-size=4096"
 
 jobs:
   build:
     strategy:
-    # Failure in one platform build won't impact the others
       fail-fast: false
       matrix:
-        build:
-          - name: 'App'
-            platform:  'linux/amd64'
+        include:
+          - name: 'linux'
             os: 'ubuntu-latest'
-          - name: 'App'
-            platform:  'windows/amd64'
+            goos: 'linux'
+            goarch: 'amd64'
+            extension: ''
+          - name: 'windows'
             os: 'windows-latest'
-          - name: 'App'
-            platform:  'darwin/universal'
+            goos: 'windows'
+            goarch: 'amd64'
+            extension: '.exe'
+          - name: 'macos'
             os: 'macos-latest'
+            goos: 'darwin'
+            goarch: 'amd64'
+            extension: '.app'
 
-    runs-on: ${{ matrix.build.os }}
+    runs-on: ${{ matrix.os }}
+    
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Build wails
-        uses: dAppServer/wails-build-action@main
-        id: build
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          build-name: ${{ matrix.build.name }}
-          build-platform: ${{ matrix.build.platform }}
           go-version: '1.23'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install Linux dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build Wails app
+        run: wails build -platform ${{ matrix.goos }}/${{ matrix.goarch }}
+
+      - name: List build output (debug)
+        run: |
+          echo "Build directory contents:"
+          ls -la build/bin/ || echo "build/bin/ not found"
+          find build/ -type f -name "*" | head -20 || echo "No files in build/"
+        shell: bash
+
+      - name: Prepare artifacts (Linux/Windows)
+        if: matrix.name != 'macos'
+        run: |
+          mkdir -p artifacts
+          if [ -f "build/bin/myproject${{ matrix.extension }}" ]; then
+            cp "build/bin/myproject${{ matrix.extension }}" "artifacts/myproject-${{ matrix.name }}${{ matrix.extension }}"
+          elif [ -f "build/bin/App${{ matrix.extension }}" ]; then
+            cp "build/bin/App${{ matrix.extension }}" "artifacts/myproject-${{ matrix.name }}${{ matrix.extension }}"
+          else
+            echo "Binary not found, listing all files:"
+            find build/bin/ -type f
+          fi
+        shell: bash
+
+      - name: Prepare artifacts (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          mkdir -p artifacts
+          if [ -d "build/bin/myproject.app" ]; then
+            ditto -c -k --keepParent "build/bin/myproject.app" "artifacts/myproject-macos.app.zip"
+          elif [ -d "build/bin/App.app" ]; then
+            ditto -c -k --keepParent "build/bin/App.app" "artifacts/myproject-macos.app.zip"
+          else
+            echo "App bundle not found, listing all files:"
+            find build/bin/ -type f -o -type d
+          fi
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: myproject-${{ matrix.name }}-${{ github.ref_name }}
+          path: artifacts/*
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List downloaded artifacts (debug)
+        run: |
+          echo "Downloaded artifacts:"
+          find ./artifacts -type f
+        
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
